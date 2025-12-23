@@ -23,6 +23,39 @@ export const dynamic = 'force-dynamic';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// -----------------------------
+// Intent classification
+// -----------------------------
+type Intent = 'quiz' | 'chat' | 'explain';
+
+/**
+ * Classifies user intent using simple, deterministic rules.
+ * This does NOT call an LLM and does NOT affect behavior yet.
+ */
+function classifyIntent(userText: string): Intent {
+  const text = userText.toLowerCase();
+
+  if (
+    text.includes('quiz') ||
+    text.includes('assessment') ||
+    text.includes('which career') ||
+    text.includes('help me decide')
+  ) {
+    return 'quiz';
+  }
+
+  if (
+    text.includes('explain') ||
+    text.includes('difference between') ||
+    text.includes('what is the difference') ||
+    text.includes('how does')
+  ) {
+    return 'explain';
+  }
+
+  return 'chat';
+}
+
 // Helper to provide default followups on error
 function defaultFollowups(): string[] {
   return [
@@ -40,6 +73,7 @@ export async function POST(req: NextRequest) {
   let lastUserRaw = '';
   let effectiveLocation: string | null = null;
   let internalRAG = '';
+  let intent: Intent = 'chat'; // Default intent
 
   try {
     // 1. Run all "pre-work" (RAG, context building, checks)
@@ -50,6 +84,12 @@ export async function POST(req: NextRequest) {
     lastUserRaw = preambleResult.lastUserRaw;
     effectiveLocation = preambleResult.effectiveLocation;
     internalRAG = preambleResult.internalRAG;
+
+    // 1.5 Classify intent (based on last user message)
+    if (lastUserRaw) {
+      intent = classifyIntent(lastUserRaw);
+      console.log('[SkillStrong] Intent detected:', intent);
+    }
     
     // 2. Handle guard conditions
     if (preambleResult.domainGuarded) {
@@ -76,7 +116,7 @@ export async function POST(req: NextRequest) {
     const responseStream = await openai.chat.completions.create({
       model: 'gpt-4.1-mini',
       temperature: 0.3,
-      messages: [...systemMessages, ...messagesForLLM] as any, // Fix 1
+      messages: [...systemMessages, ...messagesForLLM] as any,
       stream: true,
     });
 
@@ -84,7 +124,7 @@ export async function POST(req: NextRequest) {
     const data = new experimental_StreamData();
 
     // 6. Convert the OpenAI stream to the Vercel AI SDK stream (v3 style)
-    const stream = OpenAIStream(responseStream as any, { // Fix 2
+    const stream = OpenAIStream(responseStream as any, {
       onFinal: async (completion) => {
         // This logic runs *after* the stream is done
         
@@ -93,7 +133,7 @@ export async function POST(req: NextRequest) {
         try {
           const featured = await findFeaturedMatching(
             lastUserRaw,
-            effectiveLocation ?? undefined // Fix 3
+            effectiveLocation ?? undefined
           );
           if (Array.isArray(featured) && featured.length > 0) {
             const locTxt = effectiveLocation ? ` near ${effectiveLocation}` : '';
@@ -109,7 +149,6 @@ export async function POST(req: NextRequest) {
         // b. Add "Next Steps"
         let finalAnswerWithSteps = answerWithFeatured;
         if (internalRAG) {
-          // Check if we triggered the internal search
           finalAnswerWithSteps = finalAnswerWithSteps.replace(
             /(\n\n\*\*Next Steps:\*\*.*)/is,
             ''
@@ -122,30 +161,28 @@ You can also search for more opportunities on your own:
 * [Search for jobs on Indeed.com](https://www.indeed.com/)`;
         }
 
-        // c. Generate Followups (FIX #2)
-        // We pass the full message history that the LLM used
+        // c. Generate Followups
         const finalMessages: Message[] = [
-            ...messagesForLLM, 
-            { id: 'final_answer', role: 'assistant', content: finalAnswerWithSteps }
+          ...messagesForLLM, 
+          { id: 'final_answer', role: 'assistant', content: finalAnswerWithSteps }
         ];
         
         const followups = await generateFollowups(
-          finalMessages, // Pass full context
+          finalMessages,
           finalAnswerWithSteps,
           effectiveLocation ?? undefined
         );
 
         // d. Append final data to the StreamData
-        data.append(JSON.stringify({ // v3 expects a string
+        data.append(JSON.stringify({
           finalAnswer: finalAnswerWithSteps,
           followups: followups,
         }));
 
         // e. Close the StreamData
         data.close();
-
       },
-      experimental_streamData: true, // Tell it to use the data stream
+      experimental_streamData: true,
     });
 
     // 7. Return the streaming response
@@ -153,25 +190,25 @@ You can also search for more opportunities on your own:
     
   } catch (e: any) {
     if (e.message === 'LOCATION_REQUIRED') {
-      // Handle the specific "location missing" error
       return NextResponse.json({
         answer:
           'To find local results, please set your location using the button in the header.',
-        followups: [], // Send empty followups
+        followups: [],
       });
     }
 
     console.error("Error in /api/chat route:", e);
-    // Generate followups even on error
-     const errorFollowups = await generateFollowups(
-          messagesForLLM, // Pass whatever context we had
-          "Sorry, I couldn't process that.",
-          effectiveLocation ?? undefined
-     );
+
+    const errorFollowups = await generateFollowups(
+      messagesForLLM,
+      "Sorry, I couldn't process that.",
+      effectiveLocation ?? undefined
+    );
+
     return NextResponse.json(
       { 
-          answer: "Sorry, I couldn't process that.", 
-          followups: errorFollowups.length > 0 ? errorFollowups : defaultFollowups()
+        answer: "Sorry, I couldn't process that.", 
+        followups: errorFollowups.length > 0 ? errorFollowups : defaultFollowups()
       },
       { status: 500 }
     );
